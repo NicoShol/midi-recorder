@@ -1,0 +1,15 @@
+#!.venv/bin/python
+
+import mido
+
+# Lister les ports disponibles
+print(mido.get_input_names())
+
+with mido.open_input() as inport:  # ou mido.open_input('Nom du port')
+    for msg in inport:
+        if msg.type == 'note_on':
+            print(f"note={msg.note} vel={msg.velocity} ch={msg.channel}")
+        elif msg.type == 'note_off':
+            print(f"note={msg.note} ch={msg.channel}")
+        elif msg.type == 'control_change':
+            print(f"cc={msg.control} val={msg.value} ch={msg.channel}")   
