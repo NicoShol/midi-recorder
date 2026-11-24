@@ -21,6 +21,7 @@ uv run piano.py record --no-gui       # record in the terminal only; Ctrl+C to s
 uv run piano.py play song.mid         # replay a MIDI file as falling notes
 uv run piano.py play song.mid --synth # replay through the Mac's speakers
 uv run piano.py play song.mid --mute  # replay without sound
+uv run piano.py export song.mid       # save the falling-notes view as song.mp4
 ```
 
 Recordings without `-o` go to `recordings/` as `YYYY-MM-DD_HH-MM-SS.mid`. Silence before the first note is trimmed. Quitting while recording still saves the take.
@@ -28,6 +29,20 @@ Recordings without `-o` go to `recordings/` as `YYYY-MM-DD_HH-MM-SS.mid`. Silenc
 If several devices are connected, choose the input with `--port NAME` (a partial name is enough).
 
 `play` sends the notes to your piano if it's connected, so the piano plays the file itself. Without a piano, it plays through the Mac's speakers using FluidSynth (see below). Use `--synth` to force the Mac's speakers, `--out NAME` to pick a MIDI output, or `--mute` for picture only.
+
+## Exporting a video
+
+`export` renders the falling-notes view to an MP4 (H.264 + AAC) with the piano sound from FluidSynth. It runs faster than real time, with no window, and needs `ffmpeg` (`brew install ffmpeg`).
+
+```sh
+uv run piano.py export song.mid                          # 1920x1080, 60 fps -> song.mp4
+uv run piano.py export song.mid -o clip.mp4 --size 1080x1920 --fps 30   # vertical, for phones
+uv run piano.py export song.mid --fit --title "My piece"
+```
+
+- `--fit` zooms the keyboard to the octaves the song uses (on by default for vertical videos; `--no-fit` to turn it off).
+- `--title TEXT` sets the text in the top-left corner (default: file name; `--title ""` for none).
+- `--speed N` sets the scroll speed in pixels per second; `--mute` makes a silent video.
 
 ## Sound without the piano (FluidSynth)
 

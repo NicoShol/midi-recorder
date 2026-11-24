@@ -4,6 +4,7 @@
     uv run piano.py record [-o take.mid]    # live view, recording starts immediately
     uv run piano.py record --no-gui         # terminal-only recording, Ctrl+C to stop
     uv run piano.py play song.mid           # falling-notes playback of a MIDI file
+    uv run piano.py export song.mid         # save that view as song.mp4 (with sound)
     uv run piano.py ports                   # list MIDI inputs/outputs
 
 Options: --port NAME picks an input by (partial) name. play sends sound to the piano if
@@ -70,7 +71,7 @@ SOUNDFONT_DIRS = [Path(__file__).resolve().parent / "soundfonts",
 class SynthOutput:
     """Plays MIDI messages through the Mac's speakers with FluidSynth + a SoundFont."""
 
-    def __init__(self, soundfont: str | None):
+    def __init__(self, soundfont: str | None, realtime: bool = True, samplerate: int = 44100):
         sf2 = Path(soundfont) if soundfont else next(
             (p for d in SOUNDFONT_DIRS if d.is_dir() for p in sorted(d.glob("*.sf2"))), None)
         if sf2 is None:
@@ -85,8 +86,9 @@ class SynthOutput:
         except ImportError as e:
             raise RuntimeError("FluidSynth not installed (brew install fluid-synth)") from e
 
-        self.fs = fluidsynth.Synth(gain=0.6)
-        self.fs.start(driver="coreaudio")
+        self.fs = fluidsynth.Synth(gain=0.6, samplerate=float(samplerate))
+        if realtime:
+            self.fs.start(driver="coreaudio")  # otherwise render with get_samples()
         sfid = self.fs.sfload(str(sf2))
         if sfid < 0:
             self.fs.delete()
@@ -205,16 +207,16 @@ def note_color(base, velocity: int, pitch: int):
 
 
 class Keyboard:
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, low: int = LOW, high: int = HIGH):
         import pygame
 
-        self.height = max(80, min(160, height // 5))
+        self.height = max(80, min(height // 5, width // 6))
         self.top = height - self.height
-        whites = [p for p in range(LOW, HIGH + 1) if p % 12 not in BLACK_PCS]
+        whites = [p for p in range(low, high + 1) if p % 12 not in BLACK_PCS]
         ww = width / len(whites)
         self.rects: dict[int, pygame.Rect] = {}
         x = 0.0
-        for p in range(LOW, HIGH + 1):
+        for p in range(low, high + 1):
             if p % 12 in BLACK_PCS:
                 bw = ww * 0.6
                 self.rects[p] = pygame.Rect(round(x - bw / 2), self.top,
@@ -403,6 +405,55 @@ def run_record_headless(args) -> None:
 
 # ---------------------------------------------------------------- playback
 
+class Song:
+    """A MIDI file's notes (for drawing) and events (for sound), times in seconds."""
+
+    def __init__(self, path: Path):
+        if not path.exists():
+            sys.exit(f"File not found: {path}")
+        self.path = path
+        self.notes, self.events = load_midi(path)
+        if not self.notes:
+            sys.exit(f"No notes in {path}")
+        self.starts = [n.start for n in self.notes]
+        self.max_dur = max(n.end - n.start for n in self.notes)
+        self.total = max(n.end for n in self.notes)
+        self.event_times = [t for t, _ in self.events]
+
+    def key_range(self) -> tuple[int, int]:
+        """Whole octaves (C..B) covering the song's notes, at least two octaves."""
+        low = min(n.pitch for n in self.notes)
+        high = max(n.pitch for n in self.notes)
+        low, high = low - low % 12, high + 11 - high % 12
+        if high - low < 23:  # one octave only: add the octave above (or below at the top)
+            if high + 12 <= HIGH + 11:
+                high += 12
+            else:
+                low -= 12
+        return max(LOW, low), min(HIGH, high)
+
+    def draw(self, screen, kb: Keyboard, font, pos: float, speed: float) -> None:
+        """Falling notes that hit the keyboard at their start time, plus a progress bar."""
+        import pygame
+
+        screen.fill(BG)
+        lit = {}
+        lo = bisect.bisect_left(self.starts, pos - self.max_dur)
+        hi = bisect.bisect_right(self.starts, pos + kb.top / speed)
+        for n in self.notes[lo:hi]:
+            if n.end < pos:
+                continue
+            kb.bar(screen, n.pitch, kb.top - (n.end - pos) * speed,
+                   kb.top - (n.start - pos) * speed, n.color)
+            if n.start <= pos:
+                lit[n.pitch] = n.color
+        kb.draw(screen, font, lit)
+
+        w, bar_h = screen.get_width(), max(6, screen.get_height() // 120)
+        pygame.draw.rect(screen, (50, 52, 60), (0, 0, w, bar_h))
+        pygame.draw.rect(screen, PALETTE[0], (0, 0, int(w * max(0, pos) / self.total), bar_h))
+
+
 def load_midi(path: Path) -> tuple[list[Note], list[tuple[float, mido.Message]]]:
     import pretty_midi
 
@@ -430,16 +481,8 @@ def load_midi(path: Path) -> tuple[list[Note], list[tuple[float, mido.Message]]]
 def run_play(args) -> None:
     import pygame
 
-    path = Path(args.file)
-    if not path.exists():
-        sys.exit(f"File not found: {path}")
-    notes, events = load_midi(path)
-    if not notes:
-        sys.exit(f"No notes in {path}")
-    starts = [n.start for n in notes]
-    max_dur = max(n.end - n.start for n in notes)
-    total = max(n.end for n in notes)
-    event_times = [t for t, _ in events]
+    song = Song(Path(args.file))
+    path, events, event_times, total = song.path, song.events, song.event_times, song.total
 
     out, sound_status = open_playback_output(args)
 
@@ -498,24 +541,8 @@ def run_play(args) -> None:
                         out.send(events[ev_i][1])
                     ev_i += 1
 
-            kb, screen = win.kb, win.screen
-            screen.fill(BG)
-            lit = {}
-            lo = bisect.bisect_left(starts, pos - max_dur)
-            hi = bisect.bisect_right(starts, pos + kb.top / win.speed)
-            for n in notes[lo:hi]:
-                if n.end < pos:
-                    continue
-                # Notes fall toward the keyboard and hit it at their start time.
-                kb.bar(screen, n.pitch, kb.top - (n.end - pos) * win.speed,
-                       kb.top - (n.start - pos) * win.speed, n.color)
-                if n.start <= pos:
-                    lit[n.pitch] = n.color
-            kb.draw(screen, win.font, lit)
-
-            w = screen.get_width()
-            pygame.draw.rect(screen, (50, 52, 60), (0, 0, w, 6))
-            pygame.draw.rect(screen, PALETTE[0], (0, 0, int(w * max(0, pos) / total), 6))
+            screen, w = win.screen, win.screen.get_width()
+            song.draw(screen, win.kb, win.font, pos, win.speed)
             win.text(f"{path.name}   {fmt_time(pos)} / {fmt_time(total)}", (12, 14))
             win.text(f"Sound: {out.name if out else sound_status}", (12, 36),
                      (140, 140, 150))
@@ -532,6 +559,104 @@ def run_play(args) -> None:
         if out:
             out.close()
         pygame.quit()
+
+
+# ---------------------------------------------------------------- video export
+
+def render_audio(song: Song, synth: SynthOutput, t0: float, t1: float, sr: int, wav: Path):
+    """Render the song offline from time t0 to t1 into a stereo 16-bit WAV."""
+    import wave
+
+    import numpy as np
+
+    chunks, done = [], 0
+    for t, msg in song.events:
+        target = round((t - t0) * sr)
+        if target > done:
+            chunks.append(synth.fs.get_samples(target - done))
+            done = target
+        synth.send(msg)
+    end = round((t1 - t0) * sr)
+    if end > done:
+        chunks.append(synth.fs.get_samples(end - done))
+    with wave.open(str(wav), "wb") as f:
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes(np.concatenate(chunks).astype(np.int16).tobytes())
+
+
+def run_export(args) -> None:
+    import math
+    import shutil
+    import subprocess
+    import tempfile
+
+    import pygame
+
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found (brew install ffmpeg)")
+    song = Song(Path(args.file))
+    try:
+        w, h = (int(v) for v in args.size.lower().split("x"))
+    except ValueError:
+        sys.exit(f"Bad --size {args.size!r}, expected e.g. 1920x1080")
+    out_path = Path(args.output) if args.output else song.path.with_suffix(".mp4")
+    lead_in, tail, sr = 1.5, 2.0, 44100
+    t0, t1 = -lead_in, song.total + tail
+    n_frames = math.ceil((t1 - t0) * args.fps)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = None
+        if not args.mute:
+            try:
+                synth = SynthOutput(args.soundfont, realtime=False, samplerate=sr)
+            except RuntimeError as e:
+                print(f"No sound in the video: {e}")
+            else:
+                print("Rendering audio…")
+                wav = Path(tmp) / "audio.wav"
+                render_audio(song, synth, t0, t1, sr, wav)
+                synth.close()
+
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+               "-r", str(args.fps), "-i", "-"]
+        if wav:
+            cmd += ["-i", str(wav), "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", str(out_path)]
+        ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+        pygame.font.init()
+        scale = h / 720 if w >= h else w / 720
+        font = pygame.font.Font(None, round(22 * scale))
+        title_font = pygame.font.Font(None, round(30 * scale))
+        fit = args.fit if args.fit is not None else h > w  # vertical videos zoom in
+        screen = pygame.Surface((w, h))
+        kb = Keyboard(w, h, *song.key_range()) if fit else Keyboard(w, h)
+        speed = args.speed or 180 * scale
+        title = args.title if args.title is not None else song.path.stem
+        try:
+            for i in range(n_frames):
+                pos = t0 + i / args.fps
+                song.draw(screen, kb, font, pos, speed)
+                if title:
+                    screen.blit(title_font.render(title, True, (220, 220, 220)),
+                                (round(16 * scale), round(18 * scale)))
+                ffmpeg.stdin.write(pygame.image.tobytes(screen, "RGB"))
+                if i % args.fps == 0 or i == n_frames - 1:
+                    print(f"\rRendering video… {100 * (i + 1) // n_frames}%", end="", flush=True)
+            print()
+        except (BrokenPipeError, KeyboardInterrupt):
+            print("\nExport stopped.")
+        finally:
+            ffmpeg.stdin.close()
+            ok = ffmpeg.wait() == 0
+    if ok and i == n_frames - 1:
+        print(f"Saved {out_path} ({fmt_time(t1 - t0)}, {w}x{h}, {args.fps} fps)")
+    else:
+        sys.exit("Export failed.")
 
 
 # ---------------------------------------------------------------- CLI
@@ -557,6 +682,18 @@ def main() -> None:
                    help="play through the Mac's speakers even if the piano is connected")
     p.add_argument("--soundfont", help="SoundFont (.sf2) for --synth; default: soundfonts/*.sf2")
 
+    p = sub.add_parser("export", help="save the falling-notes view of a MIDI file as a video")
+    p.add_argument("file")
+    p.add_argument("-o", "--output", help="video file (default: same name as the MIDI, .mp4)")
+    p.add_argument("--size", default="1920x1080", help="WIDTHxHEIGHT, e.g. 1080x1920 for vertical")
+    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--speed", type=float, help="scroll speed in pixels/second")
+    p.add_argument("--title", help="text shown top-left (default: file name; '' for none)")
+    p.add_argument("--fit", action=argparse.BooleanOptionalAction, default=None,
+                   help="zoom the keyboard to the octaves used (default: on for vertical)")
+    p.add_argument("--mute", action="store_true", help="video without sound")
+    p.add_argument("--soundfont", help="SoundFont (.sf2); default: soundfonts/*.sf2")
+
     sub.add_parser("ports", help="list MIDI ports")
 
     args = parser.parse_args()
@@ -569,6 +706,8 @@ def main() -> None:
         run_record_headless(args) if args.no_gui else run_live(args, record_now=True)
     elif args.cmd == "play":
         run_play(args)
+    elif args.cmd == "export":
+        run_export(args)
 
 
 if __name__ == "__main__":
